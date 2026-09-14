@@ -27,11 +27,6 @@ const FONT_BODY = "'Inter', sans-serif";
 const money = (n) =>
   n.toLocaleString("en-CA", { style: "currency", currency: "CAD", maximumFractionDigits: 0 });
 
-// Route real dealer photos through our own /api/photo proxy so the browser
-// loads them from our domain instead of hitting the dealer CDN's hotlink
-// protection directly.
-const proxiedPhoto = (src) => (src ? `/api/photo?url=${encodeURIComponent(src)}` : src);
-
 /* ---------------------------------------------------------
    DATA
 --------------------------------------------------------- */
@@ -395,7 +390,7 @@ function VehiclePhoto({ src, alt, type, variant = "card", faded = false }) {
     ? { width: "100%", height: 200, objectFit: "cover", borderRadius: 18, marginBottom: 16, opacity: faded ? 0.55 : 1 }
     : { width: 64, height: 56, objectFit: "cover", borderRadius: 12, flexShrink: 0, opacity: faded ? 0.5 : 1 };
 
-  return <img src={proxiedPhoto(src)} alt={alt} style={style} onError={() => setFailed(true)} />;
+  return <img src={src} alt={alt} style={style} onError={() => setFailed(true)} />;
 }
 
 // Multi-photo swipeable gallery with per-image fallback. If every photo in the
@@ -433,7 +428,7 @@ function VehicleGallery({ photos = [], alt, type, faded = false }) {
         {visible.map(({ src, i }) => (
           <img
             key={src}
-            src={proxiedPhoto(src)}
+            src={src}
             alt={alt}
             onError={() => setFailed((f) => ({ ...f, [i]: true }))}
             style={{ minWidth: "100%", height: 200, objectFit: "cover", flexShrink: 0, scrollSnapAlign: "start", opacity: faded ? 0.55 : 1 }}
