@@ -27,6 +27,11 @@ const FONT_BODY = "'Inter', sans-serif";
 const money = (n) =>
   n.toLocaleString("en-CA", { style: "currency", currency: "CAD", maximumFractionDigits: 0 });
 
+// Route real dealer photos through our own /api/photo proxy so the browser
+// loads them from our domain instead of hitting the dealer CDN's hotlink
+// protection directly.
+const proxiedPhoto = (src) => (src ? `/api/photo?url=${encodeURIComponent(src)}` : src);
+
 /* ---------------------------------------------------------
    DATA
 --------------------------------------------------------- */
@@ -390,7 +395,7 @@ function VehiclePhoto({ src, alt, type, variant = "card", faded = false }) {
     ? { width: "100%", height: 200, objectFit: "cover", borderRadius: 18, marginBottom: 16, opacity: faded ? 0.55 : 1 }
     : { width: 64, height: 56, objectFit: "cover", borderRadius: 12, flexShrink: 0, opacity: faded ? 0.5 : 1 };
 
-  return <img src={src} alt={alt} style={style} onError={() => setFailed(true)} />;
+  return <img src={proxiedPhoto(src)} alt={alt} style={style} onError={() => setFailed(true)} />;
 }
 
 // Multi-photo swipeable gallery with per-image fallback. If every photo in the
@@ -428,7 +433,7 @@ function VehicleGallery({ photos = [], alt, type, faded = false }) {
         {visible.map(({ src, i }) => (
           <img
             key={src}
-            src={src}
+            src={proxiedPhoto(src)}
             alt={alt}
             onError={() => setFailed((f) => ({ ...f, [i]: true }))}
             style={{ minWidth: "100%", height: 200, objectFit: "cover", flexShrink: 0, scrollSnapAlign: "start", opacity: faded ? 0.55 : 1 }}
@@ -523,31 +528,56 @@ function PrimaryButton({ children, onClick, disabled, color = C.accent }) {
    CATALOG
 --------------------------------------------------------- */
 function CatalogList({ vehicles, onSelect }) {
+  const [condition, setCondition] = useState("New"); // Rallye's priority: new stock front and center
   const [brand, setBrand] = useState("All");
   const [type, setType] = useState("All");
   const [year, setYear] = useState("All");
   const [priceIdx, setPriceIdx] = useState("0");
-  const [condition, setCondition] = useState("All");
 
-  const brands = ["All", ...Array.from(new Set(vehicles.map((v) => v.brand)))];
-  const types = ["All", ...Array.from(new Set(vehicles.map((v) => v.type)))];
-  const years = ["All", ...Array.from(new Set(vehicles.map((v) => v.year))).sort((a, b) => b - a)];
-  const conditions = ["All", ...Array.from(new Set(vehicles.map((v) => v.condition)))];
+  const byCondition = vehicles.filter((v) => v.condition === condition);
+
+  const brands = ["All", ...Array.from(new Set(byCondition.map((v) => v.brand))).sort()];
+  const types = ["All", ...Array.from(new Set(byCondition.map((v) => v.type)))];
+  const years = ["All", ...Array.from(new Set(byCondition.map((v) => v.year))).sort((a, b) => b - a)];
 
   const range = PRICE_RANGES[Number(priceIdx)];
 
-  const filtered = vehicles.filter(
+  const filtered = byCondition.filter(
     (v) =>
       (brand === "All" || v.brand === brand) &&
       (type === "All" || v.type === type) &&
       (year === "All" || v.year === Number(year)) &&
-      (condition === "All" || v.condition === condition) &&
       v.price >= range.min && v.price <= range.max
   );
 
+  const changeCondition = (c) => {
+    setCondition(c);
+    setBrand("All");
+    setType("All");
+    setYear("All");
+  };
+
   return (
     <div style={{ padding: "4px 18px 18px" }}>
-      <p style={{ fontSize: 12.5, color: C.muted, margin: "6px 0 8px" }}>Brand</p>
+      <p style={{ fontSize: 12.5, color: C.muted, margin: "6px 0 8px" }}>Condition</p>
+      <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+        {["New", "Used"].map((c) => (
+          <button
+            key={c}
+            onClick={() => changeCondition(c)}
+            style={{
+              flex: 1, padding: "10px 0", borderRadius: 12, fontSize: 14, fontFamily: FONT_DISPLAY, letterSpacing: 0.3,
+              border: `1px solid ${condition === c ? C.accent : C.border}`,
+              background: condition === c ? `${C.accent}1F` : C.surface,
+              color: condition === c ? C.accent : C.muted,
+            }}
+          >
+            {c === "New" ? "New" : "Pre-Owned"}
+          </button>
+        ))}
+      </div>
+
+      <p style={{ fontSize: 12.5, color: C.muted, margin: "0 0 8px" }}>Brand</p>
       <div style={{ display: "flex", gap: 8, overflowX: "auto", paddingBottom: 4, marginBottom: 14 }}>
         {brands.map((b) => (
           <Chip key={b} active={brand === b} onClick={() => setBrand(b)} color={C.accent}>{b}</Chip>
@@ -573,12 +603,6 @@ function CatalogList({ vehicles, onSelect }) {
           value={priceIdx}
           onChange={setPriceIdx}
           options={PRICE_RANGES.map((r, i) => ({ value: String(i), label: r.label }))}
-        />
-        <Dropdown
-          label="Condition"
-          value={condition}
-          onChange={setCondition}
-          options={conditions.map((c) => ({ value: c, label: c === "All" ? "New or used" : c }))}
         />
       </div>
 
@@ -644,7 +668,7 @@ function VehicleDetail({ vehicle, onReserve, onBack }) {
         <h2 style={{ fontFamily: FONT_DISPLAY, fontSize: 26, color: C.text, margin: 0 }}>{vehicle.brand} {vehicle.model}</h2>
         <span style={{ fontSize: 11.5, padding: "3px 9px", borderRadius: 999, color: st.color, background: st.bg, whiteSpace: "nowrap", marginTop: 4 }}>{vehicle.status}</span>
       </div>
-      <p style={{ color: C.muted, margin: "4px 0 14px", fontSize: 14 }}>{vehicle.year} · {vehicle.type}</p>
+      <p style={{ color: C.muted, margin: "4px 0 14px", fontSize: 14 }}>{vehicle.year} · {vehicle.type} · {vehicle.condition === "Used" ? "Pre-Owned" : "New"}</p>
       <div style={{ display: "flex", alignItems: "baseline", gap: 10, margin: "0 0 6px" }}>
         <span style={{ fontFamily: FONT_DISPLAY, fontSize: 24, color: C.accent }}>{money(vehicle.price)}</span>
         {vehicle.msrp && vehicle.savings ? (
@@ -659,9 +683,18 @@ function VehicleDetail({ vehicle, onReserve, onBack }) {
         <div style={{ marginBottom: 18 }} />
       )}
 
-      <p style={{ fontSize: 11.5, color: C.muted, margin: "0 0 18px", fontFamily: "monospace", letterSpacing: 0.2 }}>
+      <p style={{ fontSize: 11.5, color: C.muted, margin: "0 0 8px", fontFamily: "monospace", letterSpacing: 0.2 }}>
         Stock #{vehicle.stock}{vehicle.vin && vehicle.vin !== "N/A" ? ` · VIN ${vehicle.vin}` : ""}
       </p>
+      {(vehicle.dealer || vehicle.dealerAddress) && (
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 6, marginBottom: 18, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: "8px 10px" }}>
+          <MapPin size={14} color={C.muted} style={{ marginTop: 1, flexShrink: 0 }} />
+          <div>
+            <div style={{ fontSize: 12.5, color: C.text }}>{vehicle.dealer}</div>
+            {vehicle.dealerAddress && <div style={{ fontSize: 11.5, color: C.muted, marginTop: 1 }}>{vehicle.dealerAddress}</div>}
+          </div>
+        </div>
+      )}
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 18 }}>
         {[
@@ -1047,8 +1080,9 @@ export default function App() {
 
   return (
     <div style={{
-      maxWidth: 420, margin: "0 auto", height: "100vh", maxHeight: 860, display: "flex", flexDirection: "column",
-      background: C.base, fontFamily: FONT_BODY, overflow: "hidden", border: `1px solid ${C.border}`, borderRadius: 22,
+      maxWidth: 420, margin: "0 auto", height: "100dvh", display: "flex", flexDirection: "column",
+      background: C.base, fontFamily: FONT_BODY, overflow: "hidden",
+      paddingTop: "env(safe-area-inset-top)", paddingBottom: "env(safe-area-inset-bottom)",
     }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=Inter:wght@400;500;600&display=swap');

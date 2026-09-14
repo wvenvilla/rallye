@@ -11,6 +11,7 @@ const FEEDS = [
   { brand: "Infiniti", url: "https://www.rallyemotors-infiniti.ca/feeds.asp?feed=Auction123Feedv2" },
   { brand: "Mitsubishi", url: "https://www.rallyemotors-mitsubishi.ca/feeds.asp?feed=Auction123Feedv2" },
   { brand: "Nissan", url: "https://www.rallyemotors-nissan.ca/feeds.asp?feed=Auction123Feedv2" },
+  { brand: "Rallye Motors (Group / Pre-Owned)", url: "https://www.rallyemotors.ca/feeds.asp?feed=Auction123Feedv2" },
 ];
 
 const MAX_PER_FEED = 120; // safety cap so one huge feed can't blow up the response
@@ -79,18 +80,54 @@ function titleCase(str) {
     .join(" ");
 }
 
+// Like titleCase, but preserves tokens that look like acronyms or trims/codes
+// (contain a digit, a hyphen, or are 3 letters or fewer in all caps) instead of
+// mangling them — e.g. "QX50", "S-AWC", "RVR", "SLT" stay as-is.
+function smartTitleCase(str) {
+  if (!str) return "";
+  return str
+    .split(" ")
+    .map((w) => {
+      if (!w) return w;
+      const hasDigit = /\d/.test(w);
+      const hasHyphen = w.includes("-");
+      const lettersOnly = w.replace(/[^A-Za-z]/g, "");
+      const shortAcronym = lettersOnly.length > 0 && lettersOnly.length <= 3 && lettersOnly === lettersOnly.toUpperCase();
+      if (hasDigit || hasHyphen || shortAcronym) return w;
+      const lower = w.toLowerCase();
+      return lower[0].toUpperCase() + lower.slice(1);
+    })
+    .join(" ");
+}
+
+// Some feeds cram marketing copy into the Model field itself, e.g.
+// 'Wagoneer S Limited AWD! 0% FINANCING! ONLY 198 WEEKLY! EV!'. This pulls out
+// a clean model name plus the promo fragments as separate, short features.
+function cleanModelName(raw) {
+  if (!raw) return { model: "", promoBits: [] };
+  const parts = raw.split("!").map((s) => s.trim()).filter(Boolean);
+  const model = smartTitleCase((parts[0] || "").split("$")[0].trim());
+  const promoBits = parts.slice(1).filter((p) => p.length >= 2 && p.length < 40).map(smartTitleCase);
+  return { model, promoBits };
+}
+
 function mapType(vehTypeName, category) {
   const vt = (vehTypeName || "").toLowerCase();
   const cat = (category || "").toLowerCase();
-  if (vt.includes("truck") || cat.includes("pickup") || cat.includes("crew cab") || cat.includes("cab pickup")) return "Pickup";
+  if (vt.includes("truck") || cat.includes("truck") || cat.includes("pickup") || cat.includes("crew cab") || cat.includes("cab pickup")) return "Pickup";
   if (vt === "van" || cat.includes("van")) return "Van";
   if (vt.includes("suv") || cat.includes("suv") || cat.includes("sport utility")) return "SUV";
   if (cat.includes("sedan") || cat.includes("coupe") || cat.includes("convertible") || cat.includes("hatchback")) return "Car";
   return "SUV"; // best default for this dealer group's mix
 }
 
-function extractTransmission(options) {
-  const m = /TRANSMISSION:\s*([^,]+)/i.exec(options || "");
+function extractTransmission(row) {
+  // Some feeds populate Transmission_Description directly; others leave it
+  // blank and bury it inside the free-text Options field instead.
+  if (row.Transmission_Description && row.Transmission_Description.trim()) {
+    return titleCase(row.Transmission_Description.trim());
+  }
+  const m = /TRANSMISSION:\s*([^,]+)/i.exec(row.Options || "");
   if (!m) return "Automatic";
   return titleCase(m[1].trim());
 }
@@ -122,16 +159,20 @@ function normalizeRow(row, sourceBrand) {
     .filter(Boolean)
     .slice(0, MAX_PHOTOS_PER_VEHICLE);
 
+  const { model: cleanedModel, promoBits } = cleanModelName(row.Model || "");
   const engine = extractEngine(row.Options);
   const overlay = (row.ImageOverlayText || "").trim();
-  const features = [row.PriceText, engine, row.Drivetrain, overlay].filter(Boolean).slice(0, 4);
+  const priceText = row.PriceText && row.PriceText.trim() !== "**" && row.PriceText.trim().length > 4 ? row.PriceText.trim() : null;
+  const features = [priceText, engine, row.Drivetrain, overlay, ...promoBits].filter(Boolean).slice(0, 4);
 
   const soldFlag = /sold/i.test(overlay);
+
+  const dealerAddressParts = [row.DealerAddress, row.DealerCity, row.DealerState].filter(Boolean);
 
   return {
     id,
     brand: (row.Make || "").replace(/[®™]/g, "").trim() || sourceBrand,
-    model: titleCase(row.Model || ""),
+    model: cleanedModel,
     year: Number(row.Year) || null,
     type: mapType(row.VehTypeName, row.Category),
     price: price || msrp || 0,
@@ -140,7 +181,7 @@ function normalizeRow(row, sourceBrand) {
     mileage,
     vin: row.VIN && row.VIN.trim() ? row.VIN.trim() : "N/A",
     stock: row.Stock || "",
-    transmission: extractTransmission(row.Options),
+    transmission: extractTransmission(row),
     fuel: mapFuel(row["Fuel Type"]),
     color: titleCase(row.ExteriorColor || ""),
     status: soldFlag ? "Sold" : "Available",
@@ -148,6 +189,7 @@ function normalizeRow(row, sourceBrand) {
     photos,
     detailUrl: row["Detail-Page-URL"] || "",
     dealer: row.DealerName || sourceBrand,
+    dealerAddress: dealerAddressParts.join(", "),
     features,
     insertedDate: row.InsertedDate || "",
   };
