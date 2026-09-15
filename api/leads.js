@@ -18,9 +18,34 @@
 //     ADMIN_KEY           -> any secret you choose, protects the GET endpoint
 //
 // POST /api/leads          { type: "reservation" | "appointment", ...fields }
-// GET  /api/leads?key=...  -> list saved records (requires ADMIN_KEY)
+// GET  /api/leads?key=...             -> list saved records (JSON, requires ADMIN_KEY)
+// GET  /api/leads?key=...&format=xlsx -> download all records as an Excel file
+// GET  /api/leads?key=...&action=reset -> permanently deletes ALL saved records
 
 import { createClient } from "redis";
+import * as XLSX from "xlsx";
+
+// Turns a saved record (reservation or appointment — different shapes) into
+// one flat row with consistent columns, so both types export cleanly into
+// the same spreadsheet.
+function toRow(r) {
+  return {
+    ID: r.id,
+    Type: r.type,
+    "Created At": r.createdAt,
+    Vehicle: r.vehicle || "",
+    Stock: r.stock || "",
+    VIN: r.vin || "",
+    Location: r.location || "",
+    Services: Array.isArray(r.services) ? r.services.join(", ") : (r.service || ""),
+    Date: r.date || "",
+    Time: r.time || "",
+    Plate: r.plate || "",
+    Name: r.name || "",
+    Phone: r.phone || "",
+    Email: r.email || "",
+  };
+}
 
 // Reuse the connection across warm serverless invocations instead of
 // reconnecting on every request.
@@ -132,8 +157,27 @@ export default async function handler(req, res) {
     if (!process.env.ADMIN_KEY || req.query.key !== process.env.ADMIN_KEY) {
       return res.status(401).json({ error: "unauthorized" });
     }
+
+    const client = await getClient().catch((err) => {
+      res.status(500).json({ error: "storage_unavailable", message: String(err.message || err) });
+      return null;
+    });
+    if (!client) return;
+
+    // Danger zone: permanently clears every saved reservation/appointment.
+    if (req.query.action === "reset") {
+      try {
+        const idLists = await Promise.all(TYPES.map((t) => client.lRange(`index:${t}`, 0, -1)));
+        const ids = idLists.flat();
+        if (ids.length) await client.del(ids);
+        await client.del(TYPES.map((t) => `index:${t}`));
+        return res.status(200).json({ ok: true, deleted: ids.length });
+      } catch (err) {
+        return res.status(500).json({ error: "reset_failed", message: String(err.message || err) });
+      }
+    }
+
     try {
-      const client = await getClient();
       const type = req.query.type;
       const wantedTypes = type ? [type] : TYPES;
       const idLists = await Promise.all(wantedTypes.map((t) => client.lRange(`index:${t}`, 0, -1)));
@@ -141,6 +185,17 @@ export default async function handler(req, res) {
       const rawRecords = ids.length ? await Promise.all(ids.map((id) => client.get(id))) : [];
       const records = rawRecords.filter(Boolean).map((r) => JSON.parse(r));
       const sorted = records.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+      if (req.query.format === "xlsx") {
+        const ws = XLSX.utils.json_to_sheet(sorted.map(toRow));
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, "Leads");
+        const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+        res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+        res.setHeader("Content-Disposition", `attachment; filename="rallye-leads-${new Date().toISOString().slice(0, 10)}.xlsx"`);
+        return res.status(200).send(buf);
+      }
+
       return res.status(200).json({ total: sorted.length, records: sorted });
     } catch (err) {
       return res.status(500).json({ error: "storage_unavailable", message: String(err.message || err) });
