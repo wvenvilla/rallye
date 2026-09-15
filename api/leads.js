@@ -16,6 +16,13 @@
 const RESEND_API_URL = "https://api.resend.com/emails";
 const TYPES = ["reservation", "appointment"];
 
+// Defends against the most common copy-paste mistakes when setting env vars
+// in Vercel: trailing whitespace/newlines, or accidentally-included quotes.
+function cleanEnvEmail(v) {
+  if (!v) return v;
+  return v.trim().replace(/^["']|["']$/g, "");
+}
+
 function esc(s) {
   return String(s ?? "")
     .replace(/&/g, "&amp;")
@@ -86,7 +93,7 @@ export default async function handler(req, res) {
 
   try {
     if (type === "reservation") {
-      const to = process.env.RESERVATIONS_EMAIL;
+      const to = cleanEnvEmail(process.env.RESERVATIONS_EMAIL);
       if (!to) throw new Error("RESERVATIONS_EMAIL is not set in Vercel environment variables");
       await sendEmail({
         to,
@@ -95,7 +102,7 @@ export default async function handler(req, res) {
         replyTo: data.email,
       });
     } else {
-      const to = process.env.SERVICE_EMAIL;
+      const to = cleanEnvEmail(process.env.SERVICE_EMAIL);
       if (!to) throw new Error("SERVICE_EMAIL is not set in Vercel environment variables");
       await sendEmail({
         to,
