@@ -1,17 +1,26 @@
 // api/leads.js
-// Sends vehicle reservations and service appointments straight to email
-// instead of storing them in a database. Uses Resend (resend.com) — a
-// transactional email API, no dependency to install (plain fetch call).
+// Every reservation/appointment does TWO things in parallel:
+//   1. Gets saved permanently in Vercel KV (a real database) — so the
+//      business has a durable, queryable record even if an email bounces
+//      or gets lost.
+//   2. Triggers an email via Resend — for immediate notification.
+// Neither one blocks the other; if email fails, the record is still saved,
+// and vice versa.
 //
-// One-time setup in Vercel (Settings -> Environment Variables):
-//   RESEND_API_KEY      -> from your Resend dashboard (API Keys)
-//   RESERVATIONS_EMAIL  -> where vehicle reservations should land, e.g. sales@rallyemotors.ca
-//   SERVICE_EMAIL       -> where service appointments should land, e.g. service@rallyemotors.ca
-//   LEADS_FROM_EMAIL    -> optional, e.g. "Rallye Motors <leads@yourdomain.com>"
-//                          (requires verifying that domain in Resend; until then,
-//                          this falls back to Resend's shared test sender)
+// One-time setup in Vercel:
+//   Storage tab -> Create Database -> KV -> connect to this project
+//     (Vercel injects the KV_* env vars automatically, no copying needed)
+//   Environment Variables:
+//     RESEND_API_KEY      -> from your Resend dashboard (API Keys)
+//     RESERVATIONS_EMAIL  -> where vehicle reservations should land
+//     SERVICE_EMAIL       -> where service appointments should land
+//     LEADS_FROM_EMAIL    -> optional, requires a verified Resend domain
+//     ADMIN_KEY           -> any secret you choose, protects the GET endpoint
 //
-// POST /api/leads  { type: "reservation" | "appointment", ...fields }
+// POST /api/leads          { type: "reservation" | "appointment", ...fields }
+// GET  /api/leads?key=...  -> list saved records (requires ADMIN_KEY)
+
+import { kv } from "@vercel/kv";
 
 const RESEND_API_URL = "https://api.resend.com/emails";
 const TYPES = ["reservation", "appointment"];
@@ -80,9 +89,51 @@ async function sendEmail({ to, subject, html, replyTo }) {
   return res.json();
 }
 
+async function sendLeadEmail(type, data) {
+  if (type === "reservation") {
+    const to = cleanEnvEmail(process.env.RESERVATIONS_EMAIL);
+    if (!to) throw new Error("RESERVATIONS_EMAIL is not set in Vercel environment variables");
+    return sendEmail({
+      to,
+      subject: `New reservation: ${data.vehicle || "vehicle"}`,
+      html: reservationEmailHtml(data),
+      replyTo: data.email,
+    });
+  }
+  const to = cleanEnvEmail(process.env.SERVICE_EMAIL);
+  if (!to) throw new Error("SERVICE_EMAIL is not set in Vercel environment variables");
+  return sendEmail({
+    to,
+    subject: `New service appointment: ${data.name || "customer"} — ${data.date || ""}`,
+    html: appointmentEmailHtml(data),
+  });
+}
+
+async function saveLeadToDb(type, id, record) {
+  await kv.set(id, record);
+  await kv.lpush(`index:${type}`, id);
+}
+
 export default async function handler(req, res) {
+  if (req.method === "GET") {
+    if (!process.env.ADMIN_KEY || req.query.key !== process.env.ADMIN_KEY) {
+      return res.status(401).json({ error: "unauthorized" });
+    }
+    try {
+      const type = req.query.type;
+      const wantedTypes = type ? [type] : TYPES;
+      const idLists = await Promise.all(wantedTypes.map((t) => kv.lrange(`index:${t}`, 0, -1)));
+      const ids = idLists.flat();
+      const records = ids.length ? await kv.mget(...ids) : [];
+      const sorted = records.filter(Boolean).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+      return res.status(200).json({ total: sorted.length, records: sorted });
+    } catch (err) {
+      return res.status(500).json({ error: "storage_unavailable", message: String(err.message || err) });
+    }
+  }
+
   if (req.method !== "POST") {
-    res.setHeader("Allow", "POST");
+    res.setHeader("Allow", "GET, POST");
     return res.status(405).json({ error: "method_not_allowed" });
   }
 
@@ -91,28 +142,22 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "type must be 'reservation' or 'appointment'" });
   }
 
-  try {
-    if (type === "reservation") {
-      const to = cleanEnvEmail(process.env.RESERVATIONS_EMAIL);
-      if (!to) throw new Error("RESERVATIONS_EMAIL is not set in Vercel environment variables");
-      await sendEmail({
-        to,
-        subject: `New reservation: ${data.vehicle || "vehicle"}`,
-        html: reservationEmailHtml(data),
-        replyTo: data.email,
-      });
-    } else {
-      const to = cleanEnvEmail(process.env.SERVICE_EMAIL);
-      if (!to) throw new Error("SERVICE_EMAIL is not set in Vercel environment variables");
-      await sendEmail({
-        to,
-        subject: `New service appointment: ${data.name || "customer"} — ${data.date || ""}`,
-        html: appointmentEmailHtml(data),
-      });
-    }
-    return res.status(200).json({ ok: true });
-  } catch (err) {
-    console.error("Failed to send lead email:", err);
-    return res.status(500).json({ error: "email_failed", message: String(err.message || err) });
+  const id = `${type}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+  const record = { id, type, ...data, createdAt: new Date().toISOString() };
+
+  const [dbResult, emailResult] = await Promise.allSettled([
+    saveLeadToDb(type, id, record),
+    sendLeadEmail(type, data),
+  ]);
+
+  if (dbResult.status === "rejected") console.error("Failed to save lead to database:", dbResult.reason);
+  if (emailResult.status === "rejected") console.error("Failed to send lead email:", emailResult.reason);
+
+  const saved = dbResult.status === "fulfilled";
+  const emailed = emailResult.status === "fulfilled";
+
+  if (!saved && !emailed) {
+    return res.status(500).json({ error: "both_failed", saved, emailed });
   }
+  return res.status(200).json({ ok: true, saved, emailed });
 }
