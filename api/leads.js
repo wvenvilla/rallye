@@ -1,15 +1,15 @@
 // api/leads.js
 // Every reservation/appointment does TWO things in parallel:
-//   1. Gets saved permanently in Vercel KV (a real database) — so the
-//      business has a durable, queryable record even if an email bounces
-//      or gets lost.
+//   1. Gets saved permanently in a Redis database (Upstash, via Vercel's
+//      Storage marketplace) — so the business has a durable, queryable
+//      record even if an email bounces or gets lost.
 //   2. Triggers an email via Resend — for immediate notification.
 // Neither one blocks the other; if email fails, the record is still saved,
 // and vice versa.
 //
 // One-time setup in Vercel:
-//   Storage tab -> Create Database -> KV -> connect to this project
-//     (Vercel injects the KV_* env vars automatically, no copying needed)
+//   Storage tab -> Create Database -> Upstash -> Redis -> connect to this
+//     project with prefix "KV" (Vercel injects KV_REDIS_URL automatically)
 //   Environment Variables:
 //     RESEND_API_KEY      -> from your Resend dashboard (API Keys)
 //     RESERVATIONS_EMAIL  -> where vehicle reservations should land
@@ -20,7 +20,19 @@
 // POST /api/leads          { type: "reservation" | "appointment", ...fields }
 // GET  /api/leads?key=...  -> list saved records (requires ADMIN_KEY)
 
-import { kv } from "@vercel/kv";
+import { createClient } from "redis";
+
+// Reuse the connection across warm serverless invocations instead of
+// reconnecting on every request.
+let clientPromise;
+function getClient() {
+  if (!clientPromise) {
+    const client = createClient({ url: process.env.KV_REDIS_URL });
+    client.on("error", (err) => console.error("Redis client error:", err));
+    clientPromise = client.connect().then(() => client);
+  }
+  return clientPromise;
+}
 
 const RESEND_API_URL = "https://api.resend.com/emails";
 const TYPES = ["reservation", "appointment"];
@@ -110,8 +122,9 @@ async function sendLeadEmail(type, data) {
 }
 
 async function saveLeadToDb(type, id, record) {
-  await kv.set(id, record);
-  await kv.lpush(`index:${type}`, id);
+  const client = await getClient();
+  await client.set(id, JSON.stringify(record));
+  await client.lPush(`index:${type}`, id);
 }
 
 export default async function handler(req, res) {
@@ -120,12 +133,14 @@ export default async function handler(req, res) {
       return res.status(401).json({ error: "unauthorized" });
     }
     try {
+      const client = await getClient();
       const type = req.query.type;
       const wantedTypes = type ? [type] : TYPES;
-      const idLists = await Promise.all(wantedTypes.map((t) => kv.lrange(`index:${t}`, 0, -1)));
+      const idLists = await Promise.all(wantedTypes.map((t) => client.lRange(`index:${t}`, 0, -1)));
       const ids = idLists.flat();
-      const records = ids.length ? await kv.mget(...ids) : [];
-      const sorted = records.filter(Boolean).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+      const rawRecords = ids.length ? await Promise.all(ids.map((id) => client.get(id))) : [];
+      const records = rawRecords.filter(Boolean).map((r) => JSON.parse(r));
+      const sorted = records.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
       return res.status(200).json({ total: sorted.length, records: sorted });
     } catch (err) {
       return res.status(500).json({ error: "storage_unavailable", message: String(err.message || err) });
